@@ -139,10 +139,9 @@ def ytdlp_cmd(extra_args, cookies_path=None):
     cp  = cookies_path or COOKIES_PATH
     if cp and Path(cp).exists():
         cmd += ["--cookies", str(cp)]
-    # Use Node.js to solve YouTube's JS challenge (nsig).
-    # Required in Colab and most environments to avoid "challenge solving failed" errors.
-    if shutil.which("node"):
-        cmd += ["--js-runtimes", "node"]
+    # Use the iOS client — bypasses YouTube's JS/nsig challenge entirely.
+    # No Node.js or remote solver scripts needed; works everywhere.
+    cmd += ["--extractor-args", "youtube:player_client=ios,web"]
     return cmd + extra_args
 
 
@@ -183,20 +182,39 @@ def enumerate_channel(url, cookies_path=None, membership_only=False):
         except json.JSONDecodeError:
             pass
 
+    # Populate webpage_url for all flat entries
+    for e in entries:
+        if not e.get("webpage_url"):
+            e["webpage_url"] = e.get("url") or f"https://www.youtube.com/watch?v={e['id']}"
+
     print(f"  Found {len(entries)} video(s) in channel")
 
     if not membership_only:
-        # Populate webpage_url for flat entries
-        for e in entries:
-            if not e.get("webpage_url"):
-                e["webpage_url"] = e.get("url") or f"https://www.youtube.com/watch?v={e['id']}"
         return entries
 
-    # Membership filter — need full metadata per video for availability field
-    print("  Checking membership status per video (this may take a moment)...")
+    # ── Membership filter ────────────────────────────────────────────────────
+    # Strategy A (fast, zero extra calls):
+    #   YouTube's channel page already marks members-only videos.
+    #   yt-dlp flat-playlist entries include an `availability` field when
+    #   the channel page exposes it (requires valid cookies to see your memberships).
+    entries_with_avail = [e for e in entries if e.get("availability") is not None]
+
+    if entries_with_avail:
+        filtered = [e for e in entries if e.get("availability") == "subscriber_only"]
+        print(f"  Membership filter via channel listing: "
+              f"{len(filtered)} members-only out of {len(entries)} videos")
+        for e in filtered:
+            print(f"    ✓ {e.get('title', e['id'])[:80]}")
+        return filtered
+
+    # Strategy B (fallback — individual per-video checks):
+    #   Flat entries didn't carry availability (rare; happens on some channels).
+    #   Check each video individually. iOS client avoids JS challenge issues.
+    print(f"  Channel listing has no availability data — checking videos individually...")
+    print(f"  Tip: make sure cookies.txt is fresh and includes your membership session.")
     filtered = []
     for i, entry in enumerate(entries, 1):
-        vid_url = entry.get("url") or f"https://www.youtube.com/watch?v={entry['id']}"
+        vid_url = entry["webpage_url"]
         try:
             meta = get_metadata(vid_url, cookies_path)
             avail = meta.get("availability", "")
@@ -204,16 +222,17 @@ def enumerate_channel(url, cookies_path=None, membership_only=False):
                 filtered.append(meta)
                 print(f"  [{i}/{len(entries)}] ✓ Members-only: {meta.get('title', '?')[:70]}")
             else:
-                print(f"  [{i}/{len(entries)}] – Public (skip): {meta.get('title', '?')[:70]}")
+                print(f"  [{i}/{len(entries)}] – Public: {meta.get('title', '?')[:70]}")
         except RuntimeError as e:
             s = str(e)
             if "members-only" in s.lower() or "Join this channel" in s:
-                print(f"  [{i}/{len(entries)}] ✓ Members-only (cookies needed): {entry.get('title','?')[:70]}")
-                entry.setdefault("webpage_url", vid_url)
+                print(f"  [{i}/{len(entries)}] ✓ Members-only (access denied — refresh cookies): "
+                      f"{entry.get('title', entry['id'])[:60]}")
                 entry["availability"] = "subscriber_only"
                 filtered.append(entry)
             else:
-                print(f"  [{i}/{len(entries)}] Error: {s[:80]}")
+                # Non-fatal: skip this video, keep going
+                print(f"  [{i}/{len(entries)}] Skip ({s[:60]})")
     return filtered
 
 
