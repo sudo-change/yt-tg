@@ -139,6 +139,10 @@ def ytdlp_cmd(extra_args, cookies_path=None):
     cp  = cookies_path or COOKIES_PATH
     if cp and Path(cp).exists():
         cmd += ["--cookies", str(cp)]
+    # Use Node.js to solve YouTube's JS challenge (nsig).
+    # Required in Colab and most environments to avoid "challenge solving failed" errors.
+    if shutil.which("node"):
+        cmd += ["--js-runtimes", "node"]
     return cmd + extra_args
 
 
