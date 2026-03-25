@@ -33,14 +33,19 @@ import subprocess
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 SCRIPT_DIR   = Path(__file__).parent.resolve()
-CONFIG_PATH  = SCRIPT_DIR / "config.json"
-STATE_PATH   = SCRIPT_DIR / "state.json"
+load_dotenv(SCRIPT_DIR / ".env")
+
+CONFIG_PATH   = SCRIPT_DIR / "config.json"
+STATE_PATH    = SCRIPT_DIR / "state.json"
 DOWNLOADS_DIR = SCRIPT_DIR / "downloads"
-COOKIES_PATH = SCRIPT_DIR / "cookies.txt"
+COOKIES_PATH  = Path(os.getenv("COOKIES_PATH", SCRIPT_DIR / "cookies.txt"))
 
 MAX_CAPTION   = 1024
 MAX_FILE_MB   = 4096   # Telegram Premium upper limit
+MAX_CONCURRENT = 5     # simultaneous downloads
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -60,11 +65,30 @@ def save_json(data, path):
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
+def load_config_from_env(cfg):
+    """Overlay .env values onto config dict. .env takes priority."""
+    env_map = {
+        "TELEGRAM_BOT_TOKEN":     "bot_token",
+        "TELEGRAM_API_ID":        "api_id",
+        "TELEGRAM_API_HASH":      "api_hash",
+        "TELEGRAM_GROUP_CHAT_ID": "group_chat_id",
+    }
+    for env_key, cfg_key in env_map.items():
+        val = os.getenv(env_key)
+        if val:
+            cfg[cfg_key] = val
+    # Cast group_chat_id to int if numeric
+    gid = cfg.get("group_chat_id", "")
+    if isinstance(gid, str) and gid.lstrip("-").isdigit():
+        cfg["group_chat_id"] = int(gid)
+    return cfg
+
+
 def validate_config(cfg):
     missing = [k for k in ("bot_token", "api_id", "api_hash", "group_chat_id") if not cfg.get(k)]
     if missing:
         print(f"[ERROR] Missing config: {', '.join(missing)}")
-        print("  Run: python yt2tg.py --setup")
+        print("  Set values in .env file or run: python yt2tg.py --setup")
         sys.exit(1)
 
 
@@ -460,80 +484,97 @@ async def run(args, cfg, config_path):
     await client.start()
 
     done_n = fail_n = skip_n = 0
+    counters_lock = asyncio.Lock()
+    # Semaphore limits concurrent downloads; uploads stay sequential (Telegram rate limits)
+    dl_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+    upload_lock  = asyncio.Lock()
 
-    try:
-        for i, meta in enumerate(pending, 1):
-            vid_id  = meta.get("id") or _url_to_id(meta.get("webpage_url", ""))
-            vid_url = meta.get("webpage_url") or meta.get("url") or ""
-            title   = meta.get("title", vid_url)[:80]
+    async def process_video(i, meta):
+        nonlocal done_n, fail_n, skip_n
 
-            print(f"\n{'═'*60}")
-            print(f"[{i}/{len(pending)}] {title}")
-            print(f"  ID: {vid_id}  |  URL: {vid_url}")
+        vid_id  = meta.get("id") or _url_to_id(meta.get("webpage_url", ""))
+        vid_url = meta.get("webpage_url") or meta.get("url") or ""
+        title   = meta.get("title", vid_url)[:80]
 
-            # Need full metadata (flat-playlist entries are slim)
-            if "channel" not in meta or "description" not in meta:
-                print("  Fetching full metadata...")
-                try:
-                    meta = get_metadata(vid_url, cookies)
-                    vid_id = meta.get("id", vid_id)
-                except RuntimeError as e:
-                    print(f"  Metadata error: {e}")
-                    state.mark_failed(vid_id, str(e))
+        print(f"\n{'═'*60}")
+        print(f"[{i}/{len(pending)}] {title}")
+        print(f"  ID: {vid_id}  |  URL: {vid_url}")
+
+        # Need full metadata (flat-playlist entries are slim)
+        if "channel" not in meta or "description" not in meta:
+            print(f"  [{vid_id}] Fetching full metadata...")
+            try:
+                meta = get_metadata(vid_url, cookies)
+                vid_id = meta.get("id", vid_id)
+            except RuntimeError as e:
+                print(f"  [{vid_id}] Metadata error: {e}")
+                state.mark_failed(vid_id, str(e))
+                async with counters_lock:
                     fail_n += 1
-                    continue
+                return
 
-            # Size pre-check
-            est_bytes = meta.get("filesize_approx") or meta.get("filesize") or 0
-            if est_bytes and est_bytes > MAX_FILE_MB * 1024 * 1024:
-                msg = f"Estimated {est_bytes//1048576}MB > {MAX_FILE_MB}MB limit"
-                print(f"  Skip: {msg}")
-                state.mark_failed(vid_id, msg)
+        # Size pre-check
+        est_bytes = meta.get("filesize_approx") or meta.get("filesize") or 0
+        if est_bytes and est_bytes > MAX_FILE_MB * 1024 * 1024:
+            msg = f"Estimated {est_bytes//1048576}MB > {MAX_FILE_MB}MB limit"
+            print(f"  [{vid_id}] Skip: {msg}")
+            state.mark_failed(vid_id, msg)
+            async with counters_lock:
                 skip_n += 1
-                continue
+            return
 
-            # Topic
+        # Download — with semaphore to limit concurrency
+        vid_dl_dir = DOWNLOADS_DIR / vid_id
+        vid_dl_dir.mkdir(exist_ok=True)
+
+        async with dl_semaphore:
+            print(f"  [{vid_id}] Downloading...")
+            try:
+                file_path = await asyncio.to_thread(
+                    download_video, vid_url, vid_dl_dir, cookies
+                )
+            except RuntimeError as e:
+                print(f"  [{vid_id}] Download error: {e}")
+                state.mark_failed(vid_id, str(e))
+                async with counters_lock:
+                    fail_n += 1
+                return
+
+        size_mb = file_path.stat().st_size / 1048576
+        print(f"  [{vid_id}] File: {file_path.name} ({size_mb:.1f} MB)")
+
+        if size_mb > MAX_FILE_MB:
+            msg = f"File {size_mb:.0f}MB > {MAX_FILE_MB}MB limit"
+            print(f"  [{vid_id}] Skip: {msg}")
+            state.mark_failed(vid_id, msg)
+            async with counters_lock:
+                skip_n += 1
+            return
+
+        # Topic + Upload — sequential to avoid Telegram rate limits
+        async with upload_lock:
             channel_name = meta.get("channel") or meta.get("uploader") or "Unknown"
             channel_id   = meta.get("channel_id") or meta.get("uploader_id") or channel_name
             topic_id     = await get_or_create_topic(
                 client, cfg, chat_id, channel_id, channel_name, config_path
             )
-
-            # Download — into DOWNLOADS_DIR (persistent across Colab restarts)
-            vid_dl_dir = DOWNLOADS_DIR / vid_id
-            vid_dl_dir.mkdir(exist_ok=True)
-
-            try:
-                file_path = download_video(vid_url, vid_dl_dir, cookies)
-            except RuntimeError as e:
-                print(f"  Download error: {e}")
-                state.mark_failed(vid_id, str(e))
-                fail_n += 1
-                continue
-
-            size_mb = file_path.stat().st_size / 1048576
-            print(f"  File: {file_path.name} ({size_mb:.1f} MB)")
-
-            if size_mb > MAX_FILE_MB:
-                msg = f"File {size_mb:.0f}MB > {MAX_FILE_MB}MB limit"
-                print(f"  Skip: {msg}")
-                state.mark_failed(vid_id, msg)
-                skip_n += 1
-                continue
-
-            # Upload
             caption = build_caption(meta)
             try:
                 await upload(client, file_path, chat_id, topic_id, caption)
-                print(f"  ✓ Uploaded!")
+                print(f"  [{vid_id}] Uploaded!")
                 state.mark_done(vid_id)
-                # Clean up only after confirmed upload
                 shutil.rmtree(vid_dl_dir, ignore_errors=True)
-                done_n += 1
+                async with counters_lock:
+                    done_n += 1
             except Exception as e:
-                print(f"  Upload error: {e}")
+                print(f"  [{vid_id}] Upload error: {e}")
                 state.mark_failed(vid_id, str(e))
-                fail_n += 1
+                async with counters_lock:
+                    fail_n += 1
+
+    try:
+        tasks = [process_video(i, meta) for i, meta in enumerate(pending, 1)]
+        await asyncio.gather(*tasks)
     finally:
         await client.stop()
 
@@ -623,6 +664,7 @@ SETUP GUIDE
         return
 
     cfg = load_json(args.config)
+    cfg = load_config_from_env(cfg)
     validate_config(cfg)
 
     if not Path(args.cookies).exists():

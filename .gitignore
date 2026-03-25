@@ -1,6 +1,8 @@
 # Credentials & secrets — never commit these
+.env
 config.json
 cookies.txt
+cookie.txt
 state.json
 *.session
 *.session-journal
@@ -17,6 +19,13 @@ __pycache__/
 # Colab / Jupyter checkpoints
 .ipynb_checkpoints/
 
+# Binaries
+yt-dlp.exe
+yt-dlp
+
 # Temp files
 *.part
 yt_session*
+
+# IDE / tools
+.claude/

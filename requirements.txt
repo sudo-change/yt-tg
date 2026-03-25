@@ -2,3 +2,4 @@
 pyrogram>=2.0
 tgcrypto        # optional but recommended: speeds up Pyrogram crypto (needs gcc/MSVC)
 yt-dlp          # can also use local yt-dlp.exe binary
+python-dotenv   # load secrets from .env file
